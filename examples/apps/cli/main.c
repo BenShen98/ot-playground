@@ -38,6 +38,35 @@
 #include "openthread-system.h"
 #include "cli/cli_config.h"
 
+// https://codelabs.developers.google.com/codelabs/openthread-apis/#5
+// led indicate role state change
+#include <openthread/instance.h>
+#include <openthread/thread.h>
+#include <openthread/thread_ftd.h>
+
+
+// https://codelabs.developers.google.com/codelabs/openthread-apis/#6
+// led incidcate udp revival
+#include <string.h>
+#include <openthread/message.h>
+#include <openthread/udp.h>
+// code_utils is for the otEXPECT and otEXPECT_ACTION macros that
+// validate run-time conditions and gracefully handle errors
+#include "utils/code_utils.h"
+
+//https://codelabs.developers.google.com/codelabs/openthread-apis/#7
+// dataset for auto commissioning, in production, it should be obtained from QR code etc
+#include <openthread/dataset_ftd.h>
+
+
+void handleNetifStateChanged(uint32_t aFlags, void *aContext);
+
+#define UDP_PORT 1212
+static const char UDP_DEST_ADDR[] = "ff03::1"; // mesh-local multicast address
+static const char UDP_PAYLOAD[]   = "Hello OpenThread World!";
+
+static void setNetworkConfiguration(otInstance *aInstance);
+
 #if OPENTHREAD_EXAMPLES_SIMULATION
 #include <setjmp.h>
 #include <unistd.h>
@@ -67,6 +96,16 @@ void otTaskletsSignalPending(otInstance *aInstance)
 {
     OT_UNUSED_VARIABLE(aInstance);
 }
+
+static void initUdp(otInstance *aInstance);
+static void sendUdp(otInstance *aInstance);
+
+static void handleButtonInterrupt(otInstance *aInstance);
+
+void handleUdpReceive(void *aContext, otMessage *aMessage,
+                      const otMessageInfo *aMessageInfo);
+
+static otUdpSocket sUdpSocket;
 
 int main(int argc, char *argv[])
 {
@@ -111,10 +150,30 @@ pseudo_reset:
     otCliUartInit(instance);
 #endif
 
+    /* Register Thread state change handler */
+    otSetStateChangedCallback(instance, handleNetifStateChanged, instance);
+
+    /* Override default network credentials */
+    setNetworkConfiguration(instance);
+
+    /* init GPIO LEDs and button */
+    otSysLedInit();
+    otSysButtonInit(handleButtonInterrupt);
+
+    /* Start the Thread network interface (CLI cmd > ifconfig up) */
+    otIp6SetEnabled(instance, true);
+
+    /* Start the Thread stack (CLI cmd > thread start) */
+    otThreadSetEnabled(instance, true);
+
+    /* Register udp handler*/
+    initUdp(instance);
+
     while (!otSysPseudoResetWasRequested())
     {
         otTaskletsProcess(instance);
         otSysProcessDrivers(instance);
+        otSysButtonProcess(instance);
     }
 
     otInstanceFinalize(instance);
@@ -145,3 +204,171 @@ void otPlatLogLine(otLogLevel aLogLevel, otLogRegion aLogRegion, const char *aLo
 }
 
 #endif
+
+void handleNetifStateChanged(uint32_t aFlags, void *aContext)
+{
+   if ((aFlags & OT_CHANGED_THREAD_ROLE) != 0)
+   {
+       otDeviceRole changedRole = otThreadGetDeviceRole(aContext);
+
+       switch (changedRole)
+       {
+       case OT_DEVICE_ROLE_LEADER:
+           otSysLedSet(1, true);
+           otSysLedSet(2, false);
+           otSysLedSet(3, false);
+           break;
+
+       case OT_DEVICE_ROLE_ROUTER:
+           otSysLedSet(1, false);
+           otSysLedSet(2, true);
+           otSysLedSet(3, false);
+           break;
+
+       case OT_DEVICE_ROLE_CHILD:
+           otSysLedSet(1, false);
+           otSysLedSet(2, false);
+           otSysLedSet(3, true);
+           break;
+
+       case OT_DEVICE_ROLE_DETACHED:
+       case OT_DEVICE_ROLE_DISABLED:
+            /* Turn all state led on showing is not one of them. */
+            otSysLedSet(1, true);
+           otSysLedSet(2, true);
+           otSysLedSet(3, true);
+
+           /* Clear LED4 if Thread is not enabled. */
+           otSysLedSet(4, false);
+           break;
+        }
+    }
+}
+
+/**
+ * Function to handle button push event
+ */
+void handleButtonInterrupt(otInstance *aInstance)
+{
+    sendUdp(aInstance);
+}
+
+/**
+ * Initialize UDP socket
+ */
+void initUdp(otInstance *aInstance)
+{
+    otSockAddr  listenSockAddr;
+
+    // 0 initialise memory
+    memset(&sUdpSocket, 0, sizeof(sUdpSocket));
+    memset(&listenSockAddr, 0, sizeof(listenSockAddr));
+
+    listenSockAddr.mPort    = UDP_PORT;
+
+    otUdpOpen(aInstance, &sUdpSocket, handleUdpReceive, aInstance);
+    otUdpBind(aInstance, &sUdpSocket, &listenSockAddr);
+}
+
+/**
+ * Send a UDP datagram
+ */
+void sendUdp(otInstance *aInstance)
+{
+    otError       error = OT_ERROR_NONE;
+    otMessage *   message;
+    otMessageInfo messageInfo;
+    otIp6Address  destinationAddr;
+
+    memset(&messageInfo, 0, sizeof(messageInfo));
+
+    otIp6AddressFromString(UDP_DEST_ADDR, &destinationAddr);
+    messageInfo.mPeerAddr    = destinationAddr;
+    messageInfo.mPeerPort    = UDP_PORT;
+
+    /* Note the otEXPECT and otEXPECT_ACTION  make sure that the UDP message is valid and
+    allocated correctly in the buffer, and if not, the function gracefully handles errors
+    by jumping to the exit block, where it frees up the buffer.*/
+    message = otUdpNewMessage(aInstance, NULL);
+    otEXPECT_ACTION(message != NULL, error = OT_ERROR_NO_BUFS);
+
+    error = otMessageAppend(message, UDP_PAYLOAD, sizeof(UDP_PAYLOAD));
+    otEXPECT(error == OT_ERROR_NONE);
+
+    error = otUdpSend(aInstance, &sUdpSocket, message, &messageInfo);
+
+ exit:
+    if (error != OT_ERROR_NONE && message != NULL)
+    {
+        otMessageFree(message);
+    }
+}
+
+
+/**
+ * Function to handle UDP datagrams received on the listening socket
+ */
+void handleUdpReceive(void *aContext, otMessage *aMessage,
+                      const otMessageInfo *aMessageInfo)
+{
+    OT_UNUSED_VARIABLE(aContext);
+    OT_UNUSED_VARIABLE(aMessage);
+    OT_UNUSED_VARIABLE(aMessageInfo);
+
+    otSysLedToggle(4);
+}
+
+/**
+ * Override default network settings, such as panid, so the devices can join a network
+ */
+void setNetworkConfiguration(otInstance *aInstance)
+{
+    static char          aNetworkName[] = "OTCodelab";
+    otOperationalDataset aDataset;
+
+    memset(&aDataset, 0, sizeof(otOperationalDataset));
+
+    /*
+     * Fields that can be configured in otOperationDataset to override defaults:
+     *     Network Name, Mesh Local Prefix, Extended PAN ID, PAN ID, Delay Timer,
+     *     Channel, Channel Mask Page 0, Network Master Key, PSKc, Security Policy
+     */
+    aDataset.mActiveTimestamp                      = 1;
+    aDataset.mComponents.mIsActiveTimestampPresent = true;
+
+    /* Set Channel to 15 */
+    aDataset.mChannel                      = 15;
+    aDataset.mComponents.mIsChannelPresent = true;
+
+    /* Set Pan ID to 2222 */
+    aDataset.mPanId                      = (otPanId)0x2222;
+    aDataset.mComponents.mIsPanIdPresent = true;
+
+    /* Set Extended Pan ID to C0DE1AB5C0DE1AB5 */
+    uint8_t extPanId[OT_EXT_PAN_ID_SIZE] = {0xC0, 0xDE, 0x1A, 0xB5, 0xC0, 0xDE, 0x1A, 0xB5};
+    memcpy(aDataset.mExtendedPanId.m8, extPanId, sizeof(aDataset.mExtendedPanId));
+    aDataset.mComponents.mIsExtendedPanIdPresent = true;
+
+    /* Set master key to 1234C0DE1AB51234C0DE1AB51234C0DE */
+    uint8_t key[OT_MASTER_KEY_SIZE] = {0x12, 0x34, 0xC0, 0xDE, 0x1A, 0xB5, 0x12, 0x34, 0xC0, 0xDE, 0x1A, 0xB5};
+    memcpy(aDataset.mMasterKey.m8, key, sizeof(aDataset.mMasterKey));
+    aDataset.mComponents.mIsMasterKeyPresent = true;
+
+    /* Set Network Name to OTCodelab */
+    size_t length = strlen(aNetworkName);
+    assert(length <= OT_NETWORK_NAME_MAX_SIZE);
+    memcpy(aDataset.mNetworkName.m8, aNetworkName, length);
+    aDataset.mComponents.mIsNetworkNamePresent = true;
+
+#if OPENTHREAD_FTD
+    otDatasetSetActive(aInstance, &aDataset);
+
+    /* Set the router selection jitter to override the 2 minute default.
+       CLI cmd > routerselectionjitter 20
+       Warning: For demo purposes only - not to be used in a real product */
+    uint8_t jitterValue = 20;
+    otThreadSetRouterSelectionJitter(aInstance, jitterValue);
+#else
+    OT_UNUSED_VARIABLE(aInstance);
+#endif
+}
